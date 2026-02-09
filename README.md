@@ -54,7 +54,7 @@ This project implements a complete RL pipeline where a biologically-inspired spi
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/chess-snn-rl.git
+git clone https://github.com/andrewhamara/chess-snn-rl.git
 cd chess-snn-rl
 ```
 
