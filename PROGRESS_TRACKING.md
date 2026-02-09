@@ -212,6 +212,24 @@ Completed 1600 games in 65.7s (24.4 games/sec)
 
 ## 🔧 Troubleshooting
 
+### "ConnectionResetError" during multi-GPU training
+
+**Symptom:**
+```
+ConnectionResetError: [Errno 104] Connection reset by peer
+```
+
+**Cause:** PyTorch tensor serialization issue in multiprocessing queues
+
+**Fix:** This has been fixed! The code now converts tensors to numpy arrays for queue transfer.
+
+**Verify fix:**
+```bash
+python test_multiprocessing_fix.py
+```
+
+See `MULTIPROCESSING_FIX.md` for details.
+
 ### "Generating games..." then nothing
 
 **Cause:** Workers might be stuck or not starting

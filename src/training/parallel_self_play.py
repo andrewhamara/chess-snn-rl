@@ -5,10 +5,34 @@ import torch.multiprocessing as mp
 from typing import List, Dict
 from queue import Queue
 import os
+import numpy as np
 
 from src.chess_env.board import ChessBoard
 from src.chess_env.encoder import BoardEncoder
 from src.chess_env.move_encoding import MoveEncoder
+
+
+def convert_game_to_tensors(game: Dict) -> Dict:
+    """
+    Convert game data from numpy arrays back to PyTorch tensors.
+
+    Args:
+        game: Game dict with numpy arrays
+
+    Returns:
+        Game dict with PyTorch tensors
+    """
+    return {
+        'states': [torch.from_numpy(s) if isinstance(s, np.ndarray) else s
+                   for s in game['states']],
+        'actions': game['actions'],
+        'legal_masks': [torch.from_numpy(m) if isinstance(m, np.ndarray) else m
+                       for m in game['legal_masks']],
+        'outcome': game['outcome'],
+        'termination': game['termination'],
+        'move_count': game['move_count'],
+        'legal_move_rate': game.get('legal_move_rate', 1.0)
+    }
 
 
 def worker_play_games(rank: int, model_state: dict, num_games: int,
@@ -25,31 +49,50 @@ def worker_play_games(rank: int, model_state: dict, num_games: int,
         result_queue: Queue to put results
         device_id: GPU device ID
     """
-    # Import here to avoid issues with multiprocessing
-    from src.models.chess_snn import ChessSNN
-    from config.model_config import ModelConfig
+    try:
+        # Import here to avoid issues with multiprocessing
+        from src.models.chess_snn import ChessSNN
+        from config.model_config import ModelConfig
+        import numpy as np
 
-    # Set device for this worker
-    device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+        # Set device for this worker
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
 
-    # Create model and load state
-    model = ChessSNN(ModelConfig()).to(device)
-    model.load_state_dict(model_state)
-    model.eval()
+        # Create model and load state
+        model = ChessSNN(ModelConfig()).to(device)
+        model.load_state_dict(model_state)
+        model.eval()
 
-    # Create encoders
-    board_encoder = BoardEncoder()
-    move_encoder = MoveEncoder()
+        # Create encoders
+        board_encoder = BoardEncoder()
+        move_encoder = MoveEncoder()
 
-    # Generate games
-    games = []
-    for _ in range(num_games):
-        game = play_single_game(model, board_encoder, move_encoder,
-                               temperature, device, max_moves=200)
-        games.append(game)
+        # Generate games
+        games = []
+        for _ in range(num_games):
+            game = play_single_game(model, board_encoder, move_encoder,
+                                   temperature, device, max_moves=200)
 
-    # Put results in queue
-    result_queue.put((rank, games))
+            # Convert tensors to numpy arrays for safe multiprocessing
+            game_serializable = {
+                'states': [s.cpu().numpy() for s in game['states']],
+                'actions': game['actions'],  # Already integers
+                'legal_masks': [m.cpu().numpy() for m in game['legal_masks']],
+                'outcome': game['outcome'],
+                'termination': game['termination'],
+                'move_count': game['move_count'],
+                'legal_move_rate': game['legal_move_rate']
+            }
+            games.append(game_serializable)
+
+        # Put results in queue
+        result_queue.put((rank, games))
+
+    except Exception as e:
+        # Report errors back to main process
+        import traceback
+        error_msg = f"Worker {rank} failed: {str(e)}\n{traceback.format_exc()}"
+        result_queue.put((rank, {'error': error_msg}))
 
 
 def play_single_game(model, board_encoder: BoardEncoder,
@@ -204,42 +247,52 @@ class ParallelSelfPlayEngine:
             p.start()
             processes.append((p, rank))
 
+        # Collect results from workers
+        all_games = []
+        worker_results = {}
+        start_time = time.time()
+
         if show_progress:
             print(f"\nGenerating {num_games} games across {len(processes)} GPUs...")
             print(f"Games per GPU: {worker_games[:len(processes)]}")
             print("-" * 70)
 
-            # Show progress while workers are running
-            completed_workers = set()
-            start_time = time.time()
+        # Collect results as workers complete
+        while len(worker_results) < len(processes):
+            try:
+                rank, result = result_queue.get(timeout=5)
 
-            while len(completed_workers) < len(processes):
-                # Check result queue for completed workers
-                while not result_queue.empty():
-                    rank, games = result_queue.get()
-                    completed_workers.add(rank)
+                # Check for errors
+                if isinstance(result, dict) and 'error' in result:
+                    print(f"\n⚠️  ERROR in GPU {rank}:")
+                    print(result['error'])
+                    worker_results[rank] = []
+                    continue
+
+                # Store results
+                worker_results[rank] = result
+
+                if show_progress:
                     elapsed = time.time() - start_time
-                    total_games = sum(1 for r in range(len(processes)) if r in completed_workers) * games_per_worker
+                    num_completed = len(worker_results)
+                    total_collected = sum(len(games) for games in worker_results.values())
 
-                    print(f"[{elapsed:6.1f}s] GPU {rank}: Completed {len(games)} games | "
-                          f"Total: {len(completed_workers)}/{len(processes)} GPUs done | "
-                          f"Progress: {total_games}/{num_games} games")
+                    print(f"[{elapsed:6.1f}s] GPU {rank}: Completed {len(result)} games | "
+                          f"Total: {num_completed}/{len(processes)} GPUs done | "
+                          f"Progress: {total_collected}/{num_games} games")
 
-                if len(completed_workers) < len(processes):
-                    time.sleep(2)  # Check every 2 seconds
+            except Exception as e:
+                # Timeout or other error - check if processes are still alive
+                alive = sum(1 for p, _ in processes if p.is_alive())
+                if alive == 0 and len(worker_results) >= len(processes):
+                    break
+                if alive == 0:
+                    print(f"\n⚠️  All workers stopped but only {len(worker_results)}/{len(processes)} reported")
+                    break
 
-            # Collect all results
-            all_games = []
-            for _ in range(len(processes)):
-                if not result_queue.empty():
-                    rank, games = result_queue.get()
-                    all_games.extend(games)
-        else:
-            # No progress display - just collect results
-            all_games = []
-            for _ in range(len(processes)):
-                rank, games = result_queue.get()
-                all_games.extend(games)
+        # Combine all games
+        for rank in sorted(worker_results.keys()):
+            all_games.extend(worker_results[rank])
 
         # Wait for all processes
         for p, rank in processes:
@@ -251,6 +304,9 @@ class ParallelSelfPlayEngine:
             print(f"Completed {len(all_games)} games in {elapsed:.1f}s "
                   f"({len(all_games)/elapsed:.1f} games/sec)")
             print()
+
+        # Convert numpy arrays back to tensors for training
+        all_games = [convert_game_to_tensors(game) for game in all_games]
 
         return all_games
 
