@@ -35,13 +35,16 @@ class SelfPlayEngine:
         self.model.eval()
 
     def play_game(self, temperature: float = 1.0,
-                  store_states: bool = True) -> Dict:
+                  store_states: bool = True, verbose: bool = False,
+                  game_id: int = None) -> Dict:
         """
         Play one self-play game.
 
         Args:
             temperature: Sampling temperature for action selection
             store_states: Whether to store states for training
+            verbose: Print game moves and details
+            game_id: Game identifier for logging
 
         Returns:
             Dictionary with game data
@@ -52,6 +55,11 @@ class SelfPlayEngine:
         legal_masks = []
 
         move_count = 0
+
+        if verbose:
+            game_str = f"[Game {game_id}]" if game_id else "[Game]"
+            print(f"\n{game_str} Starting new game")
+            print(board.board)
 
         with torch.no_grad():
             while not board.is_game_over() and move_count < self.max_game_length:
@@ -78,6 +86,8 @@ class SelfPlayEngine:
                     # Fallback to random legal move if model outputs illegal move
                     move = legal_moves[torch.randint(len(legal_moves), (1,)).item()]
                     action = self.move_encoder.move_to_action(move, board.board)
+                    if verbose:
+                        print(f"  WARNING: Illegal move, using random")
 
                 # Store data
                 if store_states:
@@ -86,14 +96,28 @@ class SelfPlayEngine:
                     legal_masks.append(legal_mask.cpu())
 
                 # Make move
+                if verbose:
+                    print(f"  Move {move_count + 1}: {move.uci()} (value: {value.item():.3f})")
+
                 board.make_move(move)
                 move_count += 1
+
+                if verbose and move_count % 10 == 0:
+                    print(f"  Position after {move_count} moves:")
+                    print(board.board)
 
         # Get final outcome
         termination, outcome = board.get_outcome()
 
         # Calculate metrics
         legal_move_rate = 1.0  # We enforce legal moves in this implementation
+
+        if verbose:
+            print(f"\n  Game Over!")
+            print(f"  Result: {termination} (outcome: {outcome})")
+            print(f"  Total moves: {move_count}")
+            print(f"  Final position:")
+            print(board.board)
 
         return {
             'states': states,
@@ -106,7 +130,8 @@ class SelfPlayEngine:
         }
 
     def generate_games(self, num_games: int, temperature: float = 1.0,
-                      show_progress: bool = True) -> List[Dict]:
+                      show_progress: bool = True, verbose: bool = False,
+                      sample_every: int = 10) -> List[Dict]:
         """
         Generate multiple self-play games.
 
@@ -114,6 +139,8 @@ class SelfPlayEngine:
             num_games: Number of games to generate
             temperature: Sampling temperature
             show_progress: Show progress bar
+            verbose: Show detailed game logs
+            sample_every: If verbose, show every Nth game
 
         Returns:
             List of game dictionaries
@@ -122,11 +149,31 @@ class SelfPlayEngine:
 
         iterator = range(num_games)
         if show_progress:
-            iterator = tqdm(iterator, desc="Generating games")
+            iterator = tqdm(iterator, desc="Generating games",
+                          bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
 
-        for _ in iterator:
-            game = self.play_game(temperature=temperature)
+        for i in iterator:
+            # Show verbose output for sample games
+            show_this_game = verbose and (i % sample_every == 0)
+            game = self.play_game(
+                temperature=temperature,
+                verbose=show_this_game,
+                game_id=i+1
+            )
             games.append(game)
+
+            # Print running stats every N games
+            if show_progress and (i + 1) % (num_games // 5 or 1) == 0:
+                recent_games = games[-10:] if len(games) >= 10 else games
+                avg_moves = sum(g['move_count'] for g in recent_games) / len(recent_games)
+                outcomes = [g['outcome'] for g in recent_games]
+                draw_rate = sum(1 for o in outcomes if abs(o) < 0.5) / len(outcomes)
+
+                if isinstance(iterator, tqdm):
+                    iterator.set_postfix({
+                        'avg_moves': f'{avg_moves:.0f}',
+                        'draw_rate': f'{draw_rate:.1%}'
+                    })
 
         return games
 
