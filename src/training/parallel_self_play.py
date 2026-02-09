@@ -167,6 +167,8 @@ class ParallelSelfPlayEngine:
     def _parallel_generate(self, num_games: int, temperature: float,
                           show_progress: bool) -> List[Dict]:
         """Generate games in parallel."""
+        import time
+
         # Distribute games across workers
         games_per_worker = num_games // self.num_workers
         remainder = num_games % self.num_workers
@@ -177,9 +179,15 @@ class ParallelSelfPlayEngine:
         # Get model state dict
         model_state = self.model.state_dict()
 
-        # Create result queue
+        # Create result queue and progress tracking
         mp.set_start_method('spawn', force=True)
         result_queue = mp.Queue()
+
+        # Shared counters for progress (using Manager for cross-process sharing)
+        manager = mp.Manager()
+        progress_dict = manager.dict()
+        for i in range(self.num_workers):
+            progress_dict[i] = 0
 
         # Launch workers
         processes = []
@@ -194,22 +202,55 @@ class ParallelSelfPlayEngine:
                      result_queue, device_id)
             )
             p.start()
-            processes.append(p)
+            processes.append((p, rank))
 
         if show_progress:
-            print(f"Generating {num_games} games across {len(processes)} GPUs...")
+            print(f"\nGenerating {num_games} games across {len(processes)} GPUs...")
+            print(f"Games per GPU: {worker_games[:len(processes)]}")
+            print("-" * 70)
 
-        # Collect results
-        all_games = []
-        for _ in range(len(processes)):
-            rank, games = result_queue.get()
-            all_games.extend(games)
-            if show_progress:
-                print(f"Worker {rank} completed {len(games)} games")
+            # Show progress while workers are running
+            completed_workers = set()
+            start_time = time.time()
+
+            while len(completed_workers) < len(processes):
+                # Check result queue for completed workers
+                while not result_queue.empty():
+                    rank, games = result_queue.get()
+                    completed_workers.add(rank)
+                    elapsed = time.time() - start_time
+                    total_games = sum(1 for r in range(len(processes)) if r in completed_workers) * games_per_worker
+
+                    print(f"[{elapsed:6.1f}s] GPU {rank}: Completed {len(games)} games | "
+                          f"Total: {len(completed_workers)}/{len(processes)} GPUs done | "
+                          f"Progress: {total_games}/{num_games} games")
+
+                if len(completed_workers) < len(processes):
+                    time.sleep(2)  # Check every 2 seconds
+
+            # Collect all results
+            all_games = []
+            for _ in range(len(processes)):
+                if not result_queue.empty():
+                    rank, games = result_queue.get()
+                    all_games.extend(games)
+        else:
+            # No progress display - just collect results
+            all_games = []
+            for _ in range(len(processes)):
+                rank, games = result_queue.get()
+                all_games.extend(games)
 
         # Wait for all processes
-        for p in processes:
+        for p, rank in processes:
             p.join()
+
+        if show_progress:
+            elapsed = time.time() - start_time
+            print("-" * 70)
+            print(f"Completed {len(all_games)} games in {elapsed:.1f}s "
+                  f"({len(all_games)/elapsed:.1f} games/sec)")
+            print()
 
         return all_games
 
