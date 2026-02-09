@@ -37,10 +37,10 @@ class ChessBoard:
 
     def get_result(self) -> float:
         """
-        Get game result from current player's perspective.
+        Get game result from WHITE's perspective.
 
         Returns:
-            1.0 for win, 0.0 for draw, -1.0 for loss
+            1.0 for white win, 0.0 for draw, -1.0 for black win
         """
         if not self.board.is_game_over():
             return 0.0
@@ -48,15 +48,12 @@ class ChessBoard:
         result = self.board.result()
         if result == "1/2-1/2":
             return 0.0
-
-        # Determine winner
-        winner_is_white = result == "1-0"
-        current_is_white = self.board.turn == chess.WHITE
-
-        if winner_is_white == current_is_white:
-            return 1.0
+        elif result == "1-0":
+            return 1.0  # White won
+        elif result == "0-1":
+            return -1.0  # Black won
         else:
-            return -1.0
+            return 0.0  # Unknown result, treat as draw
 
     def get_outcome(self) -> Tuple[Optional[str], float]:
         """
